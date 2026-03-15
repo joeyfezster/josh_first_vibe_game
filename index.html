@@ -67,22 +67,96 @@
     // Expose state for Playwright tests
     window.__state = state;
 
+    // --- VOICE SYSTEM ---
+    // Pick the best available voices and assign distinct ones per vehicle.
+    // Apple "Enhanced" / "Premium" voices sound dramatically more natural than defaults.
+    let voicesReady = false;
+    let assignedVoices = [null, null, null, null]; // one per vehicle
+
+    // Preferred voices per vehicle personality, in priority order.
+    // Race Car = high energy kid voice, Truck = deep male, Bus = warm female, Train = adventurous male
+    const VOICE_PREFS = [
+      // Race Car: young/high energy
+      { prefer: ['Samantha', 'Karen', 'Moira', 'Tessa'], lang: 'en' },
+      // Truck: deep/chill
+      { prefer: ['Daniel', 'Aaron', 'Tom', 'Oliver', 'Ralph'], lang: 'en' },
+      // School Bus: warm/friendly
+      { prefer: ['Zoe', 'Fiona', 'Serena', 'Samantha', 'Karen'], lang: 'en' },
+      // Train: adventurous
+      { prefer: ['Alex', 'Fred', 'Lee', 'Daniel', 'Rishi'], lang: 'en' },
+    ];
+
+    function initVoices() {
+      const voices = speechSynthesis.getVoices();
+      if (!voices.length) return;
+      voicesReady = true;
+
+      // Filter to English voices
+      const enVoices = voices.filter(function(v) { return v.lang.startsWith('en'); });
+      if (!enVoices.length) return;
+
+      // Sort: prefer "Enhanced" or "Premium" quality voices
+      const ranked = enVoices.slice().sort(function(a, b) {
+        const aQ = (a.name.includes('Enhanced') || a.name.includes('Premium')) ? 0 : 1;
+        const bQ = (b.name.includes('Enhanced') || b.name.includes('Premium')) ? 0 : 1;
+        return aQ - bQ;
+      });
+
+      const used = new Set();
+      for (let vi = 0; vi < VOICE_PREFS.length; vi++) {
+        const pref = VOICE_PREFS[vi];
+        let picked = null;
+
+        // Try preferred names first (Enhanced versions first)
+        for (const name of pref.prefer) {
+          // Look for Enhanced/Premium variant
+          const enhanced = ranked.find(function(v) {
+            return v.name.includes(name) &&
+                   (v.name.includes('Enhanced') || v.name.includes('Premium')) &&
+                   !used.has(v.voiceURI);
+          });
+          if (enhanced) { picked = enhanced; break; }
+          // Fall back to standard
+          const standard = ranked.find(function(v) {
+            return v.name.includes(name) && !used.has(v.voiceURI);
+          });
+          if (standard) { picked = standard; break; }
+        }
+
+        // If no preferred voice found, pick any unused English voice
+        if (!picked) {
+          picked = ranked.find(function(v) { return !used.has(v.voiceURI); });
+        }
+
+        if (picked) {
+          used.add(picked.voiceURI);
+          assignedVoices[vi] = picked;
+        }
+      }
+    }
+
+    // Voices load async on most platforms
+    if (window.speechSynthesis) {
+      speechSynthesis.onvoiceschanged = initVoices;
+      initVoices(); // try immediately in case already loaded
+    }
+
     // --- VEHICLE DEFINITIONS ---
     const VEHICLE_DEFS = [
       { name: 'Race Car', color: '#e74c3c', eyeColor: '#fff', width: 40, height: 22,
-        pitch: 1.4, rate: 1.2, personality: 'excited',
+        pitch: 1.15, rate: 1.1, personality: 'excited', voiceIdx: 0,
         phrases: ["Zoom zoom!", "I'm the fastest!", "Vroom vroom!", "Let's go fast!",
                   "Beep beep!", "Catch me if you can!", "Yeehaw!", "Turbo time!"] },
       { name: 'Truck', color: '#3498db', eyeColor: '#fff', width: 44, height: 26,
-        pitch: 0.6, rate: 0.8, personality: 'chill',
+        pitch: 0.75, rate: 0.85, personality: 'chill', voiceIdx: 1,
         phrases: ["Nice and easy...", "Big truck coming through!", "Honk honk!",
                   "I'm hauling the fun!", "Slow and steady!", "Beep boop!", "What a nice road!"] },
       { name: 'School Bus', color: '#f1c40f', eyeColor: '#fff', width: 48, height: 24,
-        pitch: 1.0, rate: 1.0, personality: 'friendly',
+        pitch: 1.05, rate: 0.95, personality: 'friendly', voiceIdx: 2,
         phrases: ["Great track, Josh!", "You're so good at this!", "Woohoo!",
                   "I love this road!", "More loops please!", "This is the best!", "You're amazing!"] },
       { name: 'Train', color: '#2ecc71', eyeColor: '#fff', width: 42, height: 24,
-        pitch: 0.8, rate: 0.9, personality: 'adventurous', isTrain: true,
+        pitch: 0.9, rate: 0.9, personality: 'adventurous', isTrain: true, voiceIdx: 3,
         phrases: ["Choo choo!", "All aboard!", "Next stop: fun town!",
                   "Here comes the loop!", "Chugga chugga!", "What a ride!", "The train is rolling!"] },
     ];
@@ -614,8 +688,14 @@
       if (window.speechSynthesis) {
         speechSynthesis.cancel();
         const u = new SpeechSynthesisUtterance(text);
-        u.pitch = def.pitch;
-        u.rate = def.rate;
+
+        // Assign the best available voice for this vehicle
+        const voice = assignedVoices[def.voiceIdx];
+        if (voice) u.voice = voice;
+
+        // Add slight per-utterance variation so it doesn't sound robotic
+        u.pitch = def.pitch + (Math.random() - 0.5) * 0.1;
+        u.rate = def.rate + (Math.random() - 0.5) * 0.08;
         u.volume = 1.0;
         speechSynthesis.speak(u);
       }
@@ -726,8 +806,10 @@
       state.speechQueue = null;
       if (window.speechSynthesis) {
         const u = new SpeechSynthesisUtterance(q.text);
-        u.pitch = q.def.pitch;
-        u.rate = q.def.rate;
+        const voice = assignedVoices[q.def.voiceIdx];
+        if (voice) u.voice = voice;
+        u.pitch = q.def.pitch + (Math.random() - 0.5) * 0.1;
+        u.rate = q.def.rate + (Math.random() - 0.5) * 0.08;
         speechSynthesis.speak(u);
       }
     }
