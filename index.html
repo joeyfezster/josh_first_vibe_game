@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>Josh's Track Game</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { overscroll-behavior: none; }
+    html, body { width: 100%; height: 100%; overflow: hidden; touch-action: none; background: #000; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #clearBtn {
+      position: fixed; bottom: 16px; right: 16px; width: 60px; height: 60px;
+      border-radius: 50%; background: #e74c3c; border: 3px solid #c0392b;
+      color: #fff; font-size: 28px; font-weight: bold; line-height: 54px;
+      text-align: center; z-index: 10; cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    @media (orientation: portrait) {
+      body::after {
+        content: '\21BB  Turn your phone sideways!';
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0, 0, 0, 0.85); color: #fff;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 24px; font-family: Arial, sans-serif; z-index: 100;
+      }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <div id="clearBtn">✕</div>
+  <script>
+    // --- CONSTANTS ---
+    const DPR = window.devicePixelRatio || 1;
+
+    // --- CANVAS SETUP ---
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth * DPR;
+      canvas.height = window.innerHeight * DPR;
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // --- GAME STATE ---
+    const state = {
+      segments: [],
+      flatPath: [],
+      vehicles: [],
+      vehiclesSpawned: false,
+      buffer: [],
+      touchStart: null,
+      isDrawing: false,
+      speechUnlocked: false,
+      speechQueue: null,
+      nextChatterTime: 0,
+      activeBubble: null,
+    };
+
+    // Expose state for Playwright tests
+    window.__state = state;
+
+    // --- VEHICLE DEFINITIONS ---
+    const VEHICLE_DEFS = [
+      { name: 'Race Car', color: '#e74c3c', eyeColor: '#fff', width: 40, height: 22,
+        pitch: 1.4, rate: 1.2, personality: 'excited',
+        phrases: ["Zoom zoom!", "I'm the fastest!", "Vroom vroom!", "Let's go fast!",
+                  "Beep beep!", "Catch me if you can!", "Yeehaw!", "Turbo time!"] },
+      { name: 'Truck', color: '#3498db', eyeColor: '#fff', width: 44, height: 26,
+        pitch: 0.6, rate: 0.8, personality: 'chill',
+        phrases: ["Nice and easy...", "Big truck coming through!", "Honk honk!",
+                  "I'm hauling the fun!", "Slow and steady!", "Beep boop!", "What a nice road!"] },
+      { name: 'School Bus', color: '#f1c40f', eyeColor: '#fff', width: 48, height: 24,
+        pitch: 1.0, rate: 1.0, personality: 'friendly',
+        phrases: ["Great track, Josh!", "You're so good at this!", "Woohoo!",
+                  "I love this road!", "More loops please!", "This is the best!", "You're amazing!"] },
+      { name: 'Train', color: '#2ecc71', eyeColor: '#fff', width: 42, height: 24,
+        pitch: 0.8, rate: 0.9, personality: 'adventurous', isTrain: true,
+        phrases: ["Choo choo!", "All aboard!", "Next stop: fun town!",
+                  "Here comes the loop!", "Chugga chugga!", "What a ride!", "The train is rolling!"] },
+    ];
+
+    // --- BACKGROUND ---
+    function drawBackground() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      const skyGrad = ctx.createLinearGradient(0, 0, 0, h);
+      skyGrad.addColorStop(0, '#87CEEB');
+      skyGrad.addColorStop(1, '#B0E0E6');
+      ctx.fillStyle = skyGrad;
+      ctx.fillRect(0, 0, w, h);
+
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+      drawCloud(w * 0.15, h * 0.1, 40);
+      drawCloud(w * 0.5, h * 0.07, 55);
+      drawCloud(w * 0.8, h * 0.13, 35);
+
+      ctx.fillStyle = '#90EE90';
+      ctx.fillRect(0, h * 0.85, w, h * 0.15);
+      ctx.fillStyle = '#7CCD7C';
+      ctx.fillRect(0, h * 0.85, w, 3);
+    }
+
+    function drawCloud(cx, cy, size) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, size * 0.5, 0, Math.PI * 2);
+      ctx.arc(cx - size * 0.35, cy + size * 0.1, size * 0.35, 0, Math.PI * 2);
+      ctx.arc(cx + size * 0.35, cy + size * 0.1, size * 0.35, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // --- SPLINE ---
+    function catmullRom(p0, p1, p2, p3, t) {
+      const t2 = t * t, t3 = t2 * t;
+      return {
+        x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t +
+            (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+            (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t +
+            (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+            (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+      };
+    }
+
+    function smoothPoints(raw) {
+      if (raw.length < 3) return raw;
+      const result = [];
+      const pts = [raw[0], ...raw, raw[raw.length - 1]];
+      for (let i = 1; i < pts.length - 2; i++) {
+        const steps = 6;
+        for (let s = 0; s < steps; s++) {
+          result.push(catmullRom(pts[i - 1], pts[i], pts[i + 1], pts[i + 2], s / steps));
+        }
+      }
+      result.push(pts[pts.length - 2]);
+      return result;
+    }
+
+    // --- GESTURE RECOGNITION ---
+    function detectGestures(points) {
+      const loopResult = detectLoop(points);
+      if (loopResult) return loopResult;
+      const hillResult = detectHill(points);
+      if (hillResult) return hillResult;
+      return null;
+    }
+
+    function detectLoop(points) {
+      if (points.length < 20) return null;
+      const end = points[points.length - 1];
+
+      for (let i = 0; i < points.length - 20; i++) {
+        if (dist(end, points[i]) < 50) {
+          const loopSegment = points.slice(i);
+          if (loopSegment.length < 15) continue;
+
+          const area = Math.abs(shoelaceArea(loopSegment));
+          if (area < 5000) continue;
+
+          const angle = cumulativeTurning(loopSegment);
+          if (angle < 270 * Math.PI / 180) continue;
+
+          const centroid = getCentroid(loopSegment);
+          const avgRadius = loopSegment.reduce((sum, p) =>
+            sum + dist(p, centroid), 0) / loopSegment.length;
+
+          const circle = [];
+          const numPts = 40;
+          const startAngle = Math.atan2(points[i].y - centroid.y, points[i].x - centroid.x);
+          for (let s = 0; s <= numPts; s++) {
+            const a = startAngle + (s / numPts) * Math.PI * 2;
+            circle.push({
+              x: centroid.x + Math.cos(a) * avgRadius,
+              y: centroid.y + Math.sin(a) * avgRadius
+            });
+          }
+
+          const before = points.slice(0, i);
+          return { points: [...before, ...circle], isLoop: true, isHill: false };
+        }
+      }
+      return null;
+    }
+
+    function detectHill(points) {
+      if (points.length < 10) return null;
+
+      for (let i = 0; i < points.length - 5; i++) {
+        let peakIdx = -1;
+        let riseStart = i;
+
+        for (let j = i + 1; j < points.length && j < i + 60; j++) {
+          if (points[j].y < points[riseStart].y - 100) {
+            peakIdx = j;
+            for (let k = j + 1; k < points.length && k < j + 60; k++) {
+              if (points[k].y > points[peakIdx].y && points[k].y - points[peakIdx].y > 100) {
+                const hSpan = Math.abs(points[k].x - points[riseStart].x);
+                if (hSpan <= 200) {
+                  const entry = points[riseStart];
+                  const peak = points[peakIdx];
+                  const exit = points[k];
+                  const parabola = generateParabola(entry, peak, exit, 30);
+                  const before = points.slice(0, riseStart);
+                  const after = points.slice(k + 1);
+                  return { points: [...before, ...parabola, ...after], isLoop: false, isHill: true };
+                }
+              }
+            }
+          }
+        }
+      }
+      return null;
+    }
+
+    function shoelaceArea(pts) {
+      let area = 0;
+      for (let i = 0; i < pts.length; i++) {
+        const j = (i + 1) % pts.length;
+        area += pts[i].x * pts[j].y;
+        area -= pts[j].x * pts[i].y;
+      }
+      return area / 2;
+    }
+
+    function cumulativeTurning(pts) {
+      let total = 0;
+      for (let i = 1; i < pts.length - 1; i++) {
+        const a1 = Math.atan2(pts[i].y - pts[i-1].y, pts[i].x - pts[i-1].x);
+        const a2 = Math.atan2(pts[i+1].y - pts[i].y, pts[i+1].x - pts[i].x);
+        let da = a2 - a1;
+        while (da > Math.PI) da -= 2 * Math.PI;
+        while (da < -Math.PI) da += 2 * Math.PI;
+        total += Math.abs(da);
+      }
+      return total;
+    }
+
+    function getCentroid(pts) {
+      const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+      const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+      return { x: cx, y: cy };
+    }
+
+    function generateParabola(entry, peak, exit, numPts) {
+      const pts = [];
+      for (let i = 0; i <= numPts; i++) {
+        const t = i / numPts;
+        const mt = 1 - t;
+        pts.push({
+          x: mt * mt * entry.x + 2 * mt * t * peak.x + t * t * exit.x,
+          y: mt * mt * entry.y + 2 * mt * t * peak.y + t * t * exit.y,
+        });
+      }
+      return pts;
+    }
+
+    // --- UTILITY ---
+    function getPos(e) {
+      const t = e.touches ? e.touches[0] : e;
+      return { x: t.clientX, y: t.clientY };
+    }
+
+    function dist(a, b) {
+      return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+    }
+
+    function totalDist(points) {
+      let d = 0;
+      for (let i = 1; i < points.length; i++) d += dist(points[i - 1], points[i]);
+      return d;
+    }
+
+    // --- TRACK ---
+    function commitStroke(rawPoints) {
+      const smoothed = smoothPoints(rawPoints);
+
+      const gesture = detectGestures(smoothed);
+      let finalPoints;
+      if (gesture) {
+        finalPoints = gesture.points;
+      } else {
+        finalPoints = smoothed;
+      }
+      const segment = {
+        points: finalPoints,
+        isLoop: gesture ? gesture.isLoop : false,
+        isHill: gesture ? gesture.isHill : false,
+      };
+
+      if (state.segments.length > 0) {
+        const prev = state.segments[state.segments.length - 1];
+        const prevEnd = prev.points[prev.points.length - 1];
+        const thisStart = finalPoints[0];
+        if (dist(prevEnd, thisStart) > 50) {
+          const bridge = { points: [prevEnd, thisStart], isLoop: false, isHill: false };
+          state.segments.push(bridge);
+        }
+      }
+
+      state.segments.push(segment);
+      rebuildFlatPath();
+
+      if (!state.vehiclesSpawned) {
+        spawnVehicles();
+        state.vehiclesSpawned = true;
+      }
+    }
+
+    function rebuildFlatPath() {
+      state.flatPath = [];
+      for (const seg of state.segments) {
+        state.flatPath.push(...seg.points);
+      }
+    }
+
+    function drawTrack() {
+      for (const seg of state.segments) {
+        drawSegmentStyled(seg.points);
+      }
+    }
+
+    function drawSegmentStyled(points) {
+      if (points.length < 2) return;
+
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y + 2);
+      for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y + 2);
+      ctx.strokeStyle = '#3E2723';
+      ctx.lineWidth = 10;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+      ctx.strokeStyle = '#5C4033';
+      ctx.lineWidth = 8;
+      ctx.stroke();
+
+      ctx.strokeStyle = '#8B7355';
+      ctx.lineWidth = 3;
+      let accum = 0;
+      for (let i = 1; i < points.length; i++) {
+        accum += dist(points[i - 1], points[i]);
+        if (accum >= 20) {
+          accum = 0;
+          const dx = points[i].x - points[i - 1].x;
+          const dy = points[i].y - points[i - 1].y;
+          const len = Math.sqrt(dx * dx + dy * dy) || 1;
+          const nx = -dy / len * 7;
+          const ny = dx / len * 7;
+          ctx.beginPath();
+          ctx.moveTo(points[i].x + nx, points[i].y + ny);
+          ctx.lineTo(points[i].x - nx, points[i].y - ny);
+          ctx.stroke();
+        }
+      }
+    }
+
+    // --- TOUCH HANDLING ---
+    canvas.addEventListener('touchstart', onStart, { passive: false });
+    canvas.addEventListener('touchmove', onMove, { passive: false });
+    canvas.addEventListener('touchend', onEnd);
+    canvas.addEventListener('mousedown', onStart);
+    canvas.addEventListener('mousemove', onMove);
+    canvas.addEventListener('mouseup', onEnd);
+
+    function onStart(e) {
+      e.preventDefault();
+      if (!state.speechUnlocked && window.speechSynthesis) {
+        const u = new SpeechSynthesisUtterance('');
+        speechSynthesis.speak(u);
+        state.speechUnlocked = true;
+      }
+      processIOSSpeechQueue();
+      const pos = getPos(e);
+      state.touchStart = { x: pos.x, y: pos.y, time: Date.now() };
+      state.buffer = [pos];
+      state.isDrawing = true;
+    }
+
+    function onMove(e) {
+      e.preventDefault();
+      if (!state.isDrawing) return;
+      const pos = getPos(e);
+      const last = state.buffer[state.buffer.length - 1];
+      if (dist(pos, last) >= 5) {
+        state.buffer.push(pos);
+      }
+    }
+
+    function onEnd(e) {
+      if (!state.isDrawing) return;
+      state.isDrawing = false;
+
+      const start = state.touchStart;
+      if (!start) return;
+
+      const endPos = state.buffer[state.buffer.length - 1] || start;
+      const duration = Date.now() - start.time;
+      const moved = dist(start, endPos);
+
+      if (moved < 15 && duration < 400) {
+        handleTap(start);
+        state.buffer = [];
+        return;
+      }
+
+      if (totalDist(state.buffer) < 30) {
+        state.buffer = [];
+        return;
+      }
+
+      commitStroke(state.buffer);
+      state.buffer = [];
+    }
+
+    // --- CLEAR BUTTON ---
+    document.getElementById('clearBtn').addEventListener('click', function() {
+      state.segments = [];
+      state.flatPath = [];
+      state.vehicles = [];
+      state.vehiclesSpawned = false;
+      state.buffer = [];
+      state.activeBubble = null;
+      state.nextChatterTime = 0;
+    });
+
+    // --- VEHICLES ---
+    function spawnVehicles() {
+      state.vehicles = VEHICLE_DEFS.map(function(def, i) {
+        return {
+          def: def,
+          progress: i * 0.15,
+          laps: 0,
+          scale: 1.0,
+          wiggleEnd: 0,
+        };
+      });
+    }
+
+    function getPointAtProgress(progress) {
+      const path = state.flatPath;
+      if (path.length < 2) return { x: 0, y: 0, angle: 0 };
+
+      let p = progress % 1;
+      if (p < 0) p += 1;
+
+      const idx = p * (path.length - 1);
+      const i = Math.floor(idx);
+      const t = idx - i;
+      const a = path[Math.min(i, path.length - 1)];
+      const b = path[Math.min(i + 1, path.length - 1)];
+
+      const x = a.x + (b.x - a.x) * t;
+      const y = a.y + (b.y - a.y) * t;
+      const angle = Math.atan2(b.y - a.y, b.x - a.x);
+      return { x: x, y: y, angle: angle };
+    }
+
+    function getTrailProgress(vehicle, carIndex) {
+      let trailProgress = vehicle.progress - carIndex * 0.05;
+      if (vehicle.laps === 0 && trailProgress < 0) trailProgress = 0;
+      else if (trailProgress < 0) trailProgress += 1;
+      return trailProgress;
+    }
+
+    function updateVehicles() {
+      if (state.flatPath.length < 2) return;
+      const baseSpeed = 0.002;
+
+      for (const v of state.vehicles) {
+        const pos = getPointAtProgress(v.progress);
+        const nextPos = getPointAtProgress(v.progress + 0.01);
+        const slope = nextPos.y - pos.y;
+        let speed = baseSpeed;
+        if (slope > 0) speed *= 1.5;
+        if (slope < 0) speed *= 0.7;
+        v.progress += speed;
+        if (v.progress >= 1) {
+          v.progress -= 1;
+          v.laps++;
+        }
+
+        if (v.scale !== 1.0 && Date.now() > v.wiggleEnd) {
+          v.scale = 1.0;
+        }
+      }
+    }
+
+    function drawVehicles() {
+      for (const v of state.vehicles) {
+        if (v.def.isTrain) {
+          for (let c = 2; c >= 1; c--) {
+            const tp = getPointAtProgress(getTrailProgress(v, c));
+            drawTrailingCar(tp, v.def.color);
+          }
+          // Connection lines
+          const enginePos = getPointAtProgress(v.progress);
+          for (let c = 1; c <= 2; c++) {
+            const tp = getPointAtProgress(getTrailProgress(v, c));
+            const prevPos = c === 1 ? enginePos : getPointAtProgress(getTrailProgress(v, c - 1));
+            ctx.beginPath();
+            ctx.moveTo(prevPos.x, prevPos.y);
+            ctx.lineTo(tp.x, tp.y);
+            ctx.strokeStyle = '#555';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          }
+        }
+
+        const pos = getPointAtProgress(v.progress);
+        drawVehicleBody(pos, v);
+      }
+    }
+
+    function drawVehicleBody(pos, vehicle) {
+      const def = vehicle.def;
+      const scale = vehicle.scale;
+      const w = def.width * scale;
+      const h = def.height * scale;
+
+      ctx.save();
+      ctx.translate(pos.x, pos.y);
+      ctx.rotate(pos.angle);
+
+      ctx.fillStyle = def.color;
+      ctx.beginPath();
+      ctx.roundRect(-w / 2, -h / 2, w, h, 6);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.fillStyle = '#333';
+      const wheelR = 5 * scale;
+      ctx.beginPath();
+      ctx.arc(-w / 3, h / 2, wheelR, 0, Math.PI * 2);
+      ctx.arc(w / 3, h / 2, wheelR, 0, Math.PI * 2);
+      ctx.fill();
+
+      const blink = Math.sin(Date.now() / 2000 + vehicle.progress * 100) > 0.95;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(w / 4, -h / 5, 4 * scale, 0, Math.PI * 2);
+      ctx.arc(w / 4, h / 5, 4 * scale, 0, Math.PI * 2);
+      ctx.fill();
+      if (!blink) {
+        ctx.fillStyle = '#222';
+        ctx.beginPath();
+        ctx.arc(w / 4 + 1, -h / 5, 2 * scale, 0, Math.PI * 2);
+        ctx.arc(w / 4 + 1, h / 5, 2 * scale, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function drawTrailingCar(pos, color) {
+      ctx.save();
+      ctx.translate(pos.x, pos.y);
+      ctx.rotate(pos.angle);
+
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      ctx.roundRect(-15, -10, 30, 20, 4);
+      ctx.fill();
+      ctx.globalAlpha = 1.0;
+
+      ctx.fillStyle = '#333';
+      ctx.beginPath();
+      ctx.arc(-8, 10, 4, 0, Math.PI * 2);
+      ctx.arc(8, 10, 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.restore();
+    }
+
+    // --- TAP HANDLING ---
+    function handleTap(pos) {
+      for (let i = 0; i < state.vehicles.length; i++) {
+        const v = state.vehicles[i];
+        const vPos = getPointAtProgress(v.progress);
+        if (dist(pos, vPos) < 60) {
+          v.scale = 1.2;
+          v.wiggleEnd = Date.now() + 300;
+          setTimeout(function() { if (v.scale > 1) v.scale = 1.0; }, 300);
+
+          const phrase = v.def.phrases[Math.floor(Math.random() * v.def.phrases.length)];
+          speak(phrase, v.def, i);
+          return;
+        }
+      }
+    }
+
+    function speak(text, def, vehicleIndex) {
+      state.activeBubble = {
+        vehicleIndex: vehicleIndex,
+        text: text,
+        startTime: Date.now(),
+        duration: 2000,
+      };
+
+      if (window.speechSynthesis) {
+        speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.pitch = def.pitch;
+        u.rate = def.rate;
+        u.volume = 1.0;
+        speechSynthesis.speak(u);
+      }
+    }
+
+    // --- SPEECH BUBBLES ---
+    function drawSpeechBubble() {
+      const b = state.activeBubble;
+      if (!b) return;
+
+      const elapsed = Date.now() - b.startTime;
+      if (elapsed > b.duration + 300) {
+        state.activeBubble = null;
+        return;
+      }
+
+      let alpha = 1;
+      if (elapsed < 200) alpha = elapsed / 200;
+      else if (elapsed > b.duration) alpha = 1 - (elapsed - b.duration) / 300;
+
+      const v = state.vehicles[b.vehicleIndex];
+      if (!v) return;
+      const pos = getPointAtProgress(v.progress);
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+
+      // Font size in logical pixels — the global DPR transform handles scaling
+      const fontSize = 16;
+      ctx.font = 'bold ' + fontSize + 'px Arial, sans-serif';
+      const metrics = ctx.measureText(b.text);
+      const tw = metrics.width + 16;
+      const th = fontSize + 12;
+      const bx = pos.x - tw / 2;
+      const by = pos.y - 45 - th;
+
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.roundRect(bx, by, tw, th, 8);
+      ctx.fill();
+      ctx.strokeStyle = '#ccc';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.moveTo(pos.x - 6, by + th);
+      ctx.lineTo(pos.x + 6, by + th);
+      ctx.lineTo(pos.x, by + th + 8);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = '#333';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(b.text, pos.x, by + th / 2);
+
+      ctx.restore();
+    }
+
+    // --- RANDOM CHATTER ---
+    const CONTEXT_PHRASES = {
+      loop: ["Wheeee! Loop de loop!", "Around we go!", "LOOOOP!", "That was awesome!"],
+      hill: ["Up up up... and DOWN!", "Roller coaster!", "Weeee down the hill!", "So high up!"],
+    };
+
+    function getTrackContext(progress) {
+      const path = state.flatPath;
+      if (path.length < 10) return 'flat';
+      const p = (progress % 1) * (path.length - 1);
+      const i = Math.max(0, Math.min(Math.floor(p), path.length - 5));
+      const dy = path[Math.min(i + 4, path.length - 1)].y - path[i].y;
+      if (Math.abs(dy) > 30) return 'hill';
+      return 'flat';
+    }
+
+    function triggerChatter() {
+      if (!state.vehiclesSpawned || state.vehicles.length === 0) return;
+      if (state.activeBubble) return;
+
+      const vi = Math.floor(Math.random() * state.vehicles.length);
+      const v = state.vehicles[vi];
+      const context = getTrackContext(v.progress);
+
+      let phrase;
+      if (context !== 'flat' && CONTEXT_PHRASES[context]) {
+        phrase = CONTEXT_PHRASES[context][Math.floor(Math.random() * CONTEXT_PHRASES[context].length)];
+      } else {
+        phrase = v.def.phrases[Math.floor(Math.random() * v.def.phrases.length)];
+      }
+
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+      if (isIOS) {
+        state.speechQueue = { text: phrase, def: v.def, vehicleIndex: vi, queuedAt: Date.now() };
+        state.activeBubble = { vehicleIndex: vi, text: phrase, startTime: Date.now(), duration: 2000 };
+      } else {
+        speak(phrase, v.def, vi);
+      }
+    }
+
+    function processIOSSpeechQueue() {
+      if (!state.speechQueue) return;
+      if (Date.now() - state.speechQueue.queuedAt > 2000) {
+        state.speechQueue = null;
+        return;
+      }
+      const q = state.speechQueue;
+      state.speechQueue = null;
+      if (window.speechSynthesis) {
+        const u = new SpeechSynthesisUtterance(q.text);
+        u.pitch = q.def.pitch;
+        u.rate = q.def.rate;
+        speechSynthesis.speak(u);
+      }
+    }
+
+    // --- MAIN LOOP ---
+    function gameLoop() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      ctx.clearRect(0, 0, w, h);
+
+      drawBackground();
+      drawTrack();
+
+      if (state.isDrawing && state.buffer.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(state.buffer[0].x, state.buffer[0].y);
+        for (let i = 1; i < state.buffer.length; i++) {
+          ctx.lineTo(state.buffer[i].x, state.buffer[i].y);
+        }
+        ctx.strokeStyle = 'rgba(92, 64, 51, 0.4)';
+        ctx.lineWidth = 8;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+      }
+
+      updateVehicles();
+      drawVehicles();
+      drawSpeechBubble();
+
+      // Random chatter timer (time-based — works on 120fps displays)
+      if (state.vehiclesSpawned) {
+        const now = Date.now();
+        if (!state.nextChatterTime) {
+          state.nextChatterTime = now + 5000 + Math.random() * 3000;
+        }
+        if (now >= state.nextChatterTime) {
+          triggerChatter();
+          state.nextChatterTime = now + 5000 + Math.random() * 3000;
+        }
+      }
+
+      requestAnimationFrame(gameLoop);
+    }
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>
