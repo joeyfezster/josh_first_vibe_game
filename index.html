@@ -49,6 +49,23 @@
     window.addEventListener('resize', resizeCanvas);
     resizeCanvas();
 
+    // --- CAMERA ---
+    const camera = {
+      x: 0,       // world offset (pan)
+      y: 0,
+      scale: 1,   // zoom level
+      minScale: 0.3,
+      maxScale: 3,
+    };
+
+    // Convert screen coordinates to world coordinates
+    function screenToWorld(sx, sy) {
+      return {
+        x: (sx - window.innerWidth / 2) / camera.scale + window.innerWidth / 2 + camera.x,
+        y: (sy - window.innerHeight / 2) / camera.scale + window.innerHeight / 2 + camera.y,
+      };
+    }
+
     // --- GAME STATE ---
     const state = {
       segments: [],
@@ -58,11 +75,20 @@
       buffer: [],
       touchStart: null,
       isDrawing: false,
+      isPinching: false,
+      pinchStartDist: 0,
+      pinchStartScale: 1,
+      pinchStartMid: null,
+      pinchStartCam: null,
       speechUnlocked: false,
       speechQueue: null,
       nextChatterTime: 0,
       activeBubble: null,
     };
+
+    // iOS detection — needed for speech synthesis workarounds
+    state.iOSDevice = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
     // Expose state for Playwright tests
     window.__state = state;
@@ -441,41 +467,135 @@
     }
 
     // --- TOUCH HANDLING ---
-    canvas.addEventListener('touchstart', onStart, { passive: false });
-    canvas.addEventListener('touchmove', onMove, { passive: false });
-    canvas.addEventListener('touchend', onEnd);
-    canvas.addEventListener('mousedown', onStart);
-    canvas.addEventListener('mousemove', onMove);
-    canvas.addEventListener('mouseup', onEnd);
+    // Mouse events (desktop): work in world coordinates via screenToWorld
+    canvas.addEventListener('mousedown', onMouseStart);
+    canvas.addEventListener('mousemove', onMouseMove);
+    canvas.addEventListener('mouseup', onMouseEnd);
 
-    function onStart(e) {
+    function onMouseStart(e) {
       e.preventDefault();
+      unlockSpeech();
+      const screenPos = { x: e.clientX, y: e.clientY };
+      const worldPos = screenToWorld(screenPos.x, screenPos.y);
+      state.touchStart = { x: worldPos.x, y: worldPos.y, time: Date.now() };
+      state.buffer = [worldPos];
+      state.isDrawing = true;
+    }
+
+    function onMouseMove(e) {
+      e.preventDefault();
+      if (!state.isDrawing) return;
+      const worldPos = screenToWorld(e.clientX, e.clientY);
+      const last = state.buffer[state.buffer.length - 1];
+      if (dist(worldPos, last) >= 5) {
+        state.buffer.push(worldPos);
+      }
+    }
+
+    function onMouseEnd(e) {
+      if (!state.isDrawing) return;
+      state.isDrawing = false;
+      finishStroke();
+    }
+
+    // Touch events (mobile): 1 finger = draw/tap, 2 fingers = pinch/pan
+    canvas.addEventListener('touchstart', onTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', onTouchEnd, { passive: false });
+
+    function pinchDist(e) {
+      const t = e.touches;
+      return Math.sqrt((t[0].clientX - t[1].clientX) ** 2 + (t[0].clientY - t[1].clientY) ** 2);
+    }
+
+    function pinchMid(e) {
+      const t = e.touches;
+      return { x: (t[0].clientX + t[1].clientX) / 2, y: (t[0].clientY + t[1].clientY) / 2 };
+    }
+
+    function onTouchStart(e) {
+      e.preventDefault();
+      unlockSpeech();
+
+      if (e.touches.length === 2) {
+        // Switch to pinch/pan mode — cancel any in-progress drawing
+        state.isDrawing = false;
+        state.buffer = [];
+        state.isPinching = true;
+        state.pinchStartDist = pinchDist(e);
+        state.pinchStartScale = camera.scale;
+        state.pinchStartMid = pinchMid(e);
+        state.pinchStartCam = { x: camera.x, y: camera.y };
+        return;
+      }
+
+      if (e.touches.length === 1 && !state.isPinching) {
+        const screenPos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        const worldPos = screenToWorld(screenPos.x, screenPos.y);
+        state.touchStart = { x: worldPos.x, y: worldPos.y, time: Date.now(), sx: screenPos.x, sy: screenPos.y };
+        state.buffer = [worldPos];
+        state.isDrawing = true;
+      }
+    }
+
+    function onTouchMove(e) {
+      e.preventDefault();
+
+      if (state.isPinching && e.touches.length === 2) {
+        // Pinch zoom
+        const currentDist = pinchDist(e);
+        const scaleRatio = currentDist / state.pinchStartDist;
+        camera.scale = Math.min(camera.maxScale, Math.max(camera.minScale,
+          state.pinchStartScale * scaleRatio));
+
+        // Pan: track midpoint movement
+        const mid = pinchMid(e);
+        const dx = (mid.x - state.pinchStartMid.x) / camera.scale;
+        const dy = (mid.y - state.pinchStartMid.y) / camera.scale;
+        camera.x = state.pinchStartCam.x - dx;
+        camera.y = state.pinchStartCam.y - dy;
+        return;
+      }
+
+      if (state.isDrawing && e.touches.length === 1) {
+        const worldPos = screenToWorld(e.touches[0].clientX, e.touches[0].clientY);
+        const last = state.buffer[state.buffer.length - 1];
+        if (dist(worldPos, last) >= 5) {
+          state.buffer.push(worldPos);
+        }
+      }
+    }
+
+    function onTouchEnd(e) {
+      e.preventDefault();
+
+      if (state.isPinching) {
+        if (e.touches.length < 2) {
+          state.isPinching = false;
+        }
+        return;
+      }
+
+      if (state.isDrawing && e.touches.length === 0) {
+        state.isDrawing = false;
+        finishStroke();
+      }
+    }
+
+    function unlockSpeech() {
       if (!state.speechUnlocked && window.speechSynthesis) {
-        const u = new SpeechSynthesisUtterance('');
+        // iOS requires a real utterance from a user gesture to unlock audio.
+        // Speak a space character (inaudible but counts as real speech).
+        const u = new SpeechSynthesisUtterance(' ');
+        u.volume = 0.01; // nearly silent
+        u.rate = 10;     // as fast as possible
         speechSynthesis.speak(u);
         state.speechUnlocked = true;
       }
       processIOSSpeechQueue();
-      const pos = getPos(e);
-      state.touchStart = { x: pos.x, y: pos.y, time: Date.now() };
-      state.buffer = [pos];
-      state.isDrawing = true;
     }
 
-    function onMove(e) {
-      e.preventDefault();
-      if (!state.isDrawing) return;
-      const pos = getPos(e);
-      const last = state.buffer[state.buffer.length - 1];
-      if (dist(pos, last) >= 5) {
-        state.buffer.push(pos);
-      }
-    }
-
-    function onEnd(e) {
-      if (!state.isDrawing) return;
-      state.isDrawing = false;
-
+    function finishStroke() {
       const start = state.touchStart;
       if (!start) return;
 
@@ -507,6 +627,10 @@
       state.buffer = [];
       state.activeBubble = null;
       state.nextChatterTime = 0;
+      // Reset camera to default view
+      camera.x = 0;
+      camera.y = 0;
+      camera.scale = 1;
     });
 
     // --- VEHICLES ---
@@ -686,18 +810,22 @@
       };
 
       if (window.speechSynthesis) {
+        // iOS Safari bug: speechSynthesis can get stuck. Cancel and resume.
         speechSynthesis.cancel();
-        const u = new SpeechSynthesisUtterance(text);
+        // Small delay after cancel helps iOS process the reset
+        setTimeout(function() {
+          const u = new SpeechSynthesisUtterance(text);
 
-        // Assign the best available voice for this vehicle
-        const voice = assignedVoices[def.voiceIdx];
-        if (voice) u.voice = voice;
+          // Assign the best available voice for this vehicle
+          const voice = assignedVoices[def.voiceIdx];
+          if (voice) u.voice = voice;
 
-        // Add slight per-utterance variation so it doesn't sound robotic
-        u.pitch = def.pitch + (Math.random() - 0.5) * 0.1;
-        u.rate = def.rate + (Math.random() - 0.5) * 0.08;
-        u.volume = 1.0;
-        speechSynthesis.speak(u);
+          // Add slight per-utterance variation so it doesn't sound robotic
+          u.pitch = def.pitch + (Math.random() - 0.5) * 0.1;
+          u.rate = def.rate + (Math.random() - 0.5) * 0.08;
+          u.volume = 1.0;
+          speechSynthesis.speak(u);
+        }, 50);
       }
     }
 
@@ -787,8 +915,9 @@
         phrase = v.def.phrases[Math.floor(Math.random() * v.def.phrases.length)];
       }
 
-      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-      if (isIOS) {
+      // On iOS, timer-based speech may be blocked. Queue it and play on next touch.
+      // On desktop/Android, speak immediately.
+      if (state.iOSDevice) {
         state.speechQueue = { text: phrase, def: v.def, vehicleIndex: vi, queuedAt: Date.now() };
         state.activeBubble = { vehicleIndex: vi, text: phrase, startTime: Date.now(), duration: 2000 };
       } else {
@@ -815,12 +944,27 @@
     }
 
     // --- MAIN LOOP ---
+    function applyCameraTransform() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      // Translate so the center of the screen is the zoom origin
+      ctx.translate(w / 2, h / 2);
+      ctx.scale(camera.scale, camera.scale);
+      ctx.translate(-w / 2 - camera.x, -h / 2 - camera.y);
+    }
+
     function gameLoop() {
       const w = window.innerWidth;
       const h = window.innerHeight;
       ctx.clearRect(0, 0, w, h);
 
+      // Background is screen-space (doesn't move with camera)
       drawBackground();
+
+      // Everything else is world-space
+      ctx.save();
+      applyCameraTransform();
+
       drawTrack();
 
       if (state.isDrawing && state.buffer.length > 1) {
@@ -830,7 +974,7 @@
           ctx.lineTo(state.buffer[i].x, state.buffer[i].y);
         }
         ctx.strokeStyle = 'rgba(92, 64, 51, 0.4)';
-        ctx.lineWidth = 8;
+        ctx.lineWidth = 8 / camera.scale; // keep visual thickness constant
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.stroke();
@@ -839,6 +983,8 @@
       updateVehicles();
       drawVehicles();
       drawSpeechBubble();
+
+      ctx.restore();
 
       // Random chatter timer (time-based — works on 120fps displays)
       if (state.vehiclesSpawned) {
